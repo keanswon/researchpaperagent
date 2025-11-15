@@ -12,6 +12,9 @@ import argparse
 import os
 from dotenv import load_dotenv
 
+import json
+from datetime import datetime
+
 load_dotenv()
 
 # Initialize models
@@ -210,10 +213,32 @@ def answer_question(query, collection_name="papers", retrieval_strategy="rerank"
     if not chunks:
         return "No relevant information found in the database."
     
+    answer, token_info = generate_answer(query, chunks, metadatas)
+    retrieval_stats = {
+        'num_chunks': len(chunks),
+        'strategy': retrieval_strategy,
+        'top_k': top_k,
+        'total_context_chars': sum(len(c) for c in chunks)
+    }
+    
+    log_benchmark(query, answer, token_info, retrieval_stats)
+    
     # Step 2: Generate answer
-    return generate_answer(query, chunks, metadatas)
+    return answer, token_info
     
+
+def log_benchmark(query, answer, token_stats, retrieval_stats, benchmark_file="benchmarks.jsonl"):
+    """Log query results for benchmarking"""
+    entry = {
+        'timestamp': datetime.now().isoformat(),
+        'query': query,
+        'answer_length': len(answer),
+        'tokens': token_stats,
+        'retrieval': retrieval_stats
+    }
     
+    with open(benchmark_file, 'a') as f:
+        f.write(json.dumps(entry) + '\n')
 
 
 def interactive_mode(collection_name="papers", retrieval_strategy="rerank"):
@@ -303,5 +328,6 @@ if __name__ == "__main__":
                                 collection_name=args.collection,
                                 retrieval_strategy=args.strategy,
                                 top_k=args.top_k)
+        
         if answer:
             print(f"\n📝 Answer:\n{answer}")
