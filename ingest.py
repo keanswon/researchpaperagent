@@ -12,11 +12,14 @@ from sentence_transformers import SentenceTransformer
 import chromadb
 import argparse
 import re
+import os
+
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 print("loading embedding model...")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2') # maybe pick a better model later but should b ok
 chroma_client = chromadb.PersistentClient(path="./vectordb")
-
 
 def parse_pdf(pdf_path):
     doc = pymupdf.open(pdf_path)
@@ -33,82 +36,60 @@ def parse_pdf(pdf_path):
     print(f"Extracted {len(page_chunks)} pages from PDF")
     return page_chunks
 
+def add_chunk_context(chunks):
+    """Add section context to each chunk"""
+    for i, chunk in enumerate(chunks):
+        # Add context header
+        context = f"[Page {chunk['page']}, Section: {chunk.get('section', 'Unknown')}]\n\n"
+        chunk['text'] = context + chunk['text']
+    return chunks
 
-# horrid chunk strategy as a baseline (fixed chunk size)
-def chunk_fixed_size(page_chunks, chunk_size=500, overlap=100):
+
+# <------------------- CHUNKING METHODS ------------------->
+
+# recursive character chunking
+def chunk_recursive(page_chunks, chunk_size=1000, overlap=200):
+    """Split by paragraphs, then sentences, then characters"""
     all_chunks = []
     
     for page_data in page_chunks:
         text = page_data['text']
-        words = text.split()
         
-        # Sliding window over words
-        for i in range(0, len(words), chunk_size - overlap):
-            chunk_words = words[i:i + chunk_size]
-            if len(chunk_words) < 50:  # Skip very small chunks
-                continue
-                
-            chunk = ' '.join(chunk_words)
-            all_chunks.append({
-                'text': chunk,
-                'page': page_data['page'],
-                'source': page_data['source']
-            })
-    
-    print(f"Created {len(all_chunks)} fixed-size chunks")
-    return all_chunks
-
-# split by headers (still not great)
-def chunk_by_section(page_chunks):
-    """
-    CHUNKING STRATEGY 2: Split by section headers
-    
-    Pros: Preserves document structure, semantic coherence
-    Cons: Sections can be very different sizes
-    """
-    # Common section patterns in papers
-    section_patterns = [
-        r'^#+\s+',  # Markdown headers
-        r'^\d+\.?\s+[A-Z]',  # "1. Introduction" or "1 Introduction"
-        r'^[A-Z][A-Z\s]+$',  # "INTRODUCTION" (all caps)
-    ]
-    
-    all_chunks = []
-    current_chunk = ""
-    current_page = None
-    
-    for page_data in page_chunks:
-        lines = page_data['text'].split('\n')
+        # Try paragraph splits first
+        paragraphs = text.split('\n\n')
         
-        for line in lines:
-            # Check if line is a section header
-            is_header = any(re.match(pattern, line.strip()) for pattern in section_patterns)
-            
-            if is_header and current_chunk.strip():
-                # Save previous section
+        for para in paragraphs:
+            if len(para) <= chunk_size:
                 all_chunks.append({
-                    'text': current_chunk.strip(),
-                    'page': current_page,
+                    'text': para,
+                    'page': page_data['page'],
                     'source': page_data['source']
                 })
-                current_chunk = line + "\n"
-                current_page = page_data['page']
             else:
-                current_chunk += line + "\n"
-                if current_page is None:
-                    current_page = page_data['page']
+                # Para too big, split by sentences
+                sentences = re.split(r'[.!?]+\s', para)
+                current_chunk = ""
+                
+                for sent in sentences:
+                    if len(current_chunk) + len(sent) <= chunk_size:
+                        current_chunk += sent + ". "
+                    else:
+                        if current_chunk:
+                            all_chunks.append({
+                                'text': current_chunk.strip(),
+                                'page': page_data['page'],
+                                'source': page_data['source']
+                            })
+                        current_chunk = sent + ". "
+                
+                if current_chunk:
+                    all_chunks.append({
+                        'text': current_chunk.strip(),
+                        'page': page_data['page'],
+                        'source': page_data['source']
+                    })
     
-    # Add final chunk
-    if current_chunk.strip():
-        all_chunks.append({
-            'text': current_chunk.strip(),
-            'page': current_page,
-            'source': page_data['source']
-        })
-    
-    print(f"Created {len(all_chunks)} section-based chunks")
     return all_chunks
-
 
 # better chunking strategy, may add agentic chunking or more advanced strategy later if needed
 def chunk_semantic(page_chunks, similarity_threshold=0.7):
@@ -165,10 +146,8 @@ def chunk_semantic(page_chunks, similarity_threshold=0.7):
 
 # choose chunking strategy
 def chunk_text(page_chunks, strategy="fixed"):
-    if strategy == "fixed":
-        return chunk_fixed_size(page_chunks, chunk_size=500, overlap=100)
-    elif strategy == "section":
-        return chunk_by_section(page_chunks)
+    if strategy == "recursive":
+        return chunk_recursive(page_chunks)
     elif strategy == "semantic":
         return chunk_semantic(page_chunks, similarity_threshold=0.7)
     else:
@@ -207,7 +186,7 @@ def embed_and_store(chunks, collection_name="papers"):
     print(f"✓ Stored {len(chunks)} chunks in vector DB")
 
 
-def process_pdf(pdf_path, chunking_strategy="fixed", collection_name="papers"):
+def process_pdf(pdf_path, chunking_strategy="recursive", collection_name="papers"):
     """
     Main ingestion pipeline
     
@@ -230,6 +209,8 @@ def process_pdf(pdf_path, chunking_strategy="fixed", collection_name="papers"):
     # Step 2: Chunk text (DIFFERENT STRATEGIES HERE)
     chunks = chunk_text(page_chunks, strategy=chunking_strategy)
     
+    chunks = add_chunk_context(chunks)
+    
     # Step 3: Embed and store
     embed_and_store(chunks, collection_name=collection_name)
     
@@ -241,8 +222,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process PDF and store in vector DB")
     parser.add_argument("pdf_path", help="Path to PDF file")
     parser.add_argument("--strategy", 
-                       choices=["fixed", "section", "semantic"],
-                       default="fixed",
+                       choices=["recursive", "semantic"],
+                       default="recursive",
                        help="Chunking strategy to use")
     parser.add_argument("--collection", 
                        default="papers",

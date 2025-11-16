@@ -5,98 +5,42 @@ Run this to ask questions about processed papers.
 Usage: python query.py "What is the main contribution?"
 """
 
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from sentence_transformers import SentenceTransformer
 import chromadb
 from openai import OpenAI
 import argparse
 import os
 from dotenv import load_dotenv
-
+import time
 import json
 from datetime import datetime
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 load_dotenv()
 
 # Initialize models
-print("loading models...")
+print("Loading models...")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
-# Initialize OpenAI client (or use Anthropic)
+# Initialize OpenAI client
 llm_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Connect to ChromaDB
 chroma_client = chromadb.PersistentClient(path="./vectordb")
 
-# basic semantic search
-def retrieve_basic(collection, query, top_k=5):
-    # Embed query
-    query_embedding = embedding_model.encode(query)
-    
-    # Search vector DB
-    results = collection.query(
-        query_embeddings=[query_embedding.tolist()],
-        n_results=top_k
-    )
-    
-    chunks = results['documents'][0]
-    metadatas = results['metadatas'][0]
-    
-    print(f"Retrieved {len(chunks)} chunks (basic search)")
-    return chunks, metadatas
 
-# retrieval with re-ranking
-def retrieve_with_rerank(collection, query, top_k=5, candidate_multiplier=4):
-    """
-    Process:
-    1. Get top_k * candidate_multiplier candidates (e.g., 20 chunks)
-    2. Re-rank using cross-encoder (more accurate but slower model)
-    3. Return top_k after re-ranking
-    """
-    # Step 1: Get more candidates than we need
-    num_candidates = top_k * candidate_multiplier
-    query_embedding = embedding_model.encode(query)
-    
-    results = collection.query(
-        query_embeddings=[query_embedding.tolist()],
-        n_results=num_candidates
-    )
-    
-    chunks = results['documents'][0]
-    metadatas = results['metadatas'][0]
-    
-    # Step 2: Re-rank using cross-encoder
-    print(f"Re-ranking {len(chunks)} candidates...")
-    pairs = [[query, chunk] for chunk in chunks]
-    scores = reranker.predict(pairs)
-    
-    # Step 3: Sort by score and take top_k
-    ranked_indices = scores.argsort()[::-1][:top_k]
-    
-    reranked_chunks = [chunks[i] for i in ranked_indices]
-    reranked_metadatas = [metadatas[i] for i in ranked_indices]
-    
-    print(f"Retrieved {len(reranked_chunks)} chunks (with re-ranking)")
-    return reranked_chunks, reranked_metadatas
-
-# hybrid semantic + keyword search
 def retrieve_hybrid(collection, query, top_k=5):
     """
-    RETRIEVAL STRATEGY 3: Hybrid semantic + keyword search
-    
-    Pros: Combines semantic understanding with exact matching
-    Cons: More complex, needs keyword index
+    Hybrid semantic + keyword search with query expansion
     
     Note: ChromaDB doesn't have built-in BM25, so this is a simplified version.
-    In production, you'd use a hybrid search engine like Weaviate or Qdrant.
+    In production, use a hybrid search engine like Weaviate or Qdrant.
     """
-    # For now, just do semantic search with query expansion
-    # A real implementation would combine BM25 + semantic scores
-    
-    # Expand query with synonyms/variations
+    # Expand query with variations
     expanded_queries = [
         query,
-        query.replace("?", ""),  # Remove question mark
+        query.replace("?", ""),
         query.lower()
     ]
     
@@ -122,81 +66,115 @@ def retrieve_hybrid(collection, query, top_k=5):
     return all_chunks[:top_k], all_metadatas[:top_k]
 
 
-def retrieve_chunks(collection, query, strategy="rerank", top_k=5):
-    if strategy == "basic":
-        return retrieve_basic(collection, query, top_k)
-    elif strategy == "rerank":
-        return retrieve_with_rerank(collection, query, top_k)
-    elif strategy == "hybrid":
-        return retrieve_hybrid(collection, query, top_k)
-    else:
-        raise ValueError(f"Unknown retrieval strategy: {strategy}")
+def deduplicate_chunks(chunks, metadatas, similarity_threshold=0.85):
+    """Remove semantically similar chunks"""
+    if len(chunks) <= 1:
+        return chunks, metadatas
+    
+    # Embed all chunks
+    embeddings = embedding_model.encode(chunks)
+    
+    unique_chunks = [chunks[0]]
+    unique_metadatas = [metadatas[0]]
+    unique_embeddings = [embeddings[0]]
+    
+    for i in range(1, len(chunks)):
+        # Check similarity with all kept chunks
+        from sentence_transformers import util
+        similarities = [util.cos_sim(embeddings[i], emb).item() 
+                       for emb in unique_embeddings]
+        
+        if max(similarities) < similarity_threshold:
+            unique_chunks.append(chunks[i])
+            unique_metadatas.append(metadatas[i])
+            unique_embeddings.append(embeddings[i])
+    
+    print(f"Kept {len(unique_chunks)}/{len(chunks)} chunks after deduplication")
+    return unique_chunks, unique_metadatas
+
+
+def retrieve_chunks(collection, query, top_k=5):
+    """Main retrieval function with deduplication"""
+    chunks, metadatas = retrieve_hybrid(collection, query, top_k)
+    chunks, metadatas = deduplicate_chunks(chunks, metadatas)
+    return chunks, metadatas
+
 
 def generate_answer(query, chunks, metadatas, model="gpt-4o-mini"):
-    """
-    Call LLM with retrieved context to generate answer
-    """
-    # Assemble context with citations
-    context = ""
-    for i, (chunk, meta) in enumerate(zip(chunks, metadatas)):
-        page = meta.get('page', 'Unknown')
-        source = meta.get('source', 'Unknown')
-        context += f"[{i+1}] (Source: {source}, Page {page}):\n{chunk}\n\n"
+    """Generate answer with streaming"""
     
-    # System prompt
-    system_prompt = """You are a research assistant analyzing academic papers. 
+    # Build context
+    context = "\n\n".join([f"[{i+1}] {chunk}" for i, chunk in enumerate(chunks)])
     
-Your task:
-1. Answer the user's question based ONLY on the provided context
-2. Always cite sources using [number] format (e.g., "According to [1], ...")
-3. If the context doesn't contain enough information, explicitly say so
-4. Be concise but thorough
-5. Include page numbers when citing
-
-Remember: Only use information from the provided context chunks."""
+    messages = [
+        {
+            "role": "system", 
+            "content": "You are a research paper Q&A assistant. Answer questions based only on the provided context. Cite sources as [N]. If information is missing, say so clearly."
+        },
+        {
+            "role": "user",
+            "content": f"Context:\n{context}\n\nQuestion: {query}"
+        }
+    ]
     
-    user_message = f"""Context from research paper(s):
-
-{context}
-
-Question: {query}
-
-Please provide a detailed answer with citations."""
+    print(f"\n🤖 Answer:\n")
+    start_time = time.time()
     
-    # LLM call
-    print(f"\nGenerating answer using {model}...")
-    response = llm_client.chat.completions.create(
+    stream = llm_client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        temperature=0.3  # Lower temperature for more factual responses
+        messages=messages,
+        temperature=0.2,
+        max_tokens=350,
+        stream=True,
+        stream_options={"include_usage": True}
     )
     
-    token_stats = {
-        'prompt_tokens': response.usage.prompt_tokens,
-        'completion_tokens': response.usage.completion_tokens,
-        'total_tokens': response.usage.total_tokens,
-        'model': model
-    }
+    full_answer = ""
+    usage_data = None
     
-    return response.choices[0].message.content, token_stats
+    for chunk in stream:
+        # Collect answer text
+        if chunk.choices and chunk.choices[0].delta.content:
+            content = chunk.choices[0].delta.content
+            print(content, end='', flush=True)
+            full_answer += content
+        
+        # The last chunk contains usage data
+        if hasattr(chunk, 'usage') and chunk.usage is not None:
+            usage_data = chunk.usage
+    
+    end_time = time.time()
+    latency_ms = (end_time - start_time) * 1000
+    print("\n")
+    
+    # Extract token counts
+    if not usage_data:
+        print("⚠️  Warning: Usage data not available")
+        token_stats = {
+            'prompt_tokens': 0,
+            'completion_tokens': len(full_answer.split()),
+            'total_tokens': 0,
+            'model': model,
+            'latency_ms': latency_ms,
+            'streaming': True
+        }
+    else:
+        token_stats = {
+            'prompt_tokens': usage_data.prompt_tokens,
+            'completion_tokens': usage_data.completion_tokens,
+            'total_tokens': usage_data.total_tokens,
+            'model': model,
+            'latency_ms': latency_ms,
+            'streaming': True
+        }
+    
+    return full_answer, token_stats
 
 
-def answer_question(query, collection_name="papers", retrieval_strategy="rerank", top_k=5):
-    """
-    Main query pipeline
-    
-    Steps:
-    1. Retrieve relevant chunks from vector DB (RETRIEVAL HAPPENS HERE)
-    2. Assemble context with metadata
-    3. Call LLM to generate answer
-    4. Return answer with citations
-    """
+def answer_question(query, collection_name="papers", top_k=5):
+    """Main query pipeline"""
     print(f"\n{'='*60}")
     print(f"Question: {query}")
-    print(f"Retrieval strategy: {retrieval_strategy}")
     print(f"{'='*60}\n")
     
     # Get collection
@@ -205,55 +183,103 @@ def answer_question(query, collection_name="papers", retrieval_strategy="rerank"
     except Exception as e:
         print(f"Error: Collection '{collection_name}' not found!")
         print("Did you run ingest.py first?")
-        return None
+        return None, None
     
-    # Step 1: Retrieve chunks (DIFFERENT STRATEGIES HERE)
-    chunks, metadatas = retrieve_chunks(collection, query, strategy=retrieval_strategy, top_k=top_k)
+    # Retrieve chunks
+    chunks, metadatas = retrieve_chunks(collection, query, top_k=top_k)
     
     if not chunks:
-        return "No relevant information found in the database."
+        print("No relevant information found in the database.")
+        return None, None
     
+    # Generate answer
     answer, token_info = generate_answer(query, chunks, metadatas)
+    
+    # Prepare retrieval stats
     retrieval_stats = {
         'num_chunks': len(chunks),
-        'strategy': retrieval_strategy,
         'top_k': top_k,
         'total_context_chars': sum(len(c) for c in chunks)
     }
     
+    # Log benchmark
     log_benchmark(query, answer, token_info, retrieval_stats)
     
-    # Step 2: Generate answer
     return answer, token_info
-    
+
 
 def log_benchmark(query, answer, token_stats, retrieval_stats, benchmark_file="benchmarks.jsonl"):
-    """Log query results for benchmarking"""
+    """Log metrics for later analysis"""
+    
+    # Calculate cost (OpenAI pricing)
+    # gpt-4o-mini: $0.15/1M input, $0.60/1M output
+    input_cost = (token_stats['prompt_tokens'] / 1_000_000) * 0.15
+    output_cost = (token_stats['completion_tokens'] / 1_000_000) * 0.60
+    total_cost = input_cost + output_cost
+    
+    # Tokens per second
+    if token_stats.get('latency_ms', 0) > 0:
+        tokens_per_sec = (token_stats['completion_tokens'] / token_stats['latency_ms']) * 1000
+    else:
+        tokens_per_sec = 0
+    
     entry = {
         'timestamp': datetime.now().isoformat(),
         'query': query,
-        'answer_length': len(answer),
-        'tokens': token_stats,
-        'retrieval': retrieval_stats
+        'answer': answer,
+        'answer_length_chars': len(answer),
+        'answer_length_words': len(answer.split()),
+        
+        # Token metrics
+        'tokens': {
+            'prompt': token_stats['prompt_tokens'],
+            'completion': token_stats['completion_tokens'],
+            'total': token_stats['total_tokens'],
+            'model': token_stats['model']
+        },
+        
+        # Performance metrics
+        'performance': {
+            'latency_ms': token_stats.get('latency_ms', 0),
+            'tokens_per_sec': round(tokens_per_sec, 2),
+            'streaming': token_stats.get('streaming', False)
+        },
+        
+        # Cost metrics
+        'cost': {
+            'input_usd': round(input_cost, 6),
+            'output_usd': round(output_cost, 6),
+            'total_usd': round(total_cost, 6)
+        },
+        
+        # Retrieval metrics
+        'retrieval': {
+            'num_chunks': retrieval_stats['num_chunks'],
+            'top_k': retrieval_stats['top_k'],
+            'total_context_chars': retrieval_stats['total_context_chars'],
+            'avg_chunk_size': retrieval_stats['total_context_chars'] // retrieval_stats['num_chunks'] if retrieval_stats['num_chunks'] > 0 else 0
+        }
     }
     
     with open(benchmark_file, 'a') as f:
         f.write(json.dumps(entry) + '\n')
+    
+    # Print summary
+    print(f"\n📊 Stats:")
+    print(f"  Tokens: {token_stats['total_tokens']} ({token_stats['prompt_tokens']} prompt + {token_stats['completion_tokens']} completion)")
+    print(f"  Latency: {token_stats.get('latency_ms', 0):.0f}ms ({tokens_per_sec:.1f} tokens/sec)")
+    print(f"  Cost: ${total_cost:.6f}")
+    print(f"  Retrieved: {retrieval_stats['num_chunks']} chunks ({retrieval_stats['total_context_chars']} chars)")
 
 
-def interactive_mode(collection_name="papers", retrieval_strategy="rerank"):
+def interactive_mode(collection_name="papers"):
     """Interactive Q&A session"""
     print("\n" + "="*60)
     print("Research Paper Q&A - Interactive Mode")
     print("="*60)
     print(f"Collection: {collection_name}")
-    print(f"Retrieval strategy: {retrieval_strategy}")
     print("\nType 'quit' or 'exit' to stop")
-    print("Type 'strategy <name>' to change retrieval strategy")
-    print("Available strategies: basic, rerank, hybrid")
     print("="*60 + "\n")
-    
-    current_strategy = retrieval_strategy
     
     while True:
         query = input("\n💬 Your question: ").strip()
@@ -265,35 +291,55 @@ def interactive_mode(collection_name="papers", retrieval_strategy="rerank"):
             print("\nGoodbye!")
             break
         
-        if query.lower().startswith('strategy '):
-            new_strategy = query.split()[1]
-            if new_strategy in ['basic', 'rerank', 'hybrid']:
-                current_strategy = new_strategy
-                print(f"✓ Switched to {current_strategy} retrieval")
-            else:
-                print(f"Unknown strategy: {new_strategy}")
-            continue
-        
-        # Answer the question
-        answer, token_info = answer_question(query, 
-                                collection_name=collection_name,
-                                retrieval_strategy=current_strategy)
-        
-        # token info in the form:
-        #     token_stats = {
-        #     'prompt_tokens': response.usage.prompt_tokens,
-        #     'completion_tokens': response.usage.completion_tokens,
-        #     'total_tokens': response.usage.total_tokens,
-        #     'model': model
-        # }
-        
-        if answer:
-            print(f"\n📝 Answer:\n{answer}")
-            
-        if token_info:
-            print("prompt tokens: ", token_info["prompt_tokens"])
-            print("completion tokens: ", token_info["completion_tokens"])
-            print("total tokens: ", token_info["total_tokens"])
+        answer_question(query, collection_name=collection_name, top_k=5)
+
+
+def analyze_benchmarks(benchmark_file="benchmarks.jsonl"):
+    """Analyze benchmark logs"""
+    try:
+        import pandas as pd
+    except ImportError:
+        print("Error: pandas required for analysis. Install with: pip install pandas")
+        return
+    
+    if not os.path.exists(benchmark_file):
+        print(f"No benchmark file found at {benchmark_file}")
+        return
+    
+    # Load all benchmark entries
+    entries = []
+    with open(benchmark_file, 'r') as f:
+        for line in f:
+            entries.append(json.loads(line))
+    
+    if not entries:
+        print("No benchmark entries found")
+        return
+    
+    df = pd.DataFrame(entries)
+    
+    print("\n" + "="*60)
+    print("BENCHMARK ANALYSIS")
+    print("="*60 + "\n")
+    
+    # Overall stats
+    print(f"Total queries: {len(df)}")
+    print(f"Total cost: ${df['cost'].apply(lambda x: x['total_usd']).sum():.4f}")
+    print(f"Avg latency: {df['performance'].apply(lambda x: x['latency_ms']).mean():.0f}ms")
+    print(f"Avg tokens/query: {df['tokens'].apply(lambda x: x['total']).mean():.0f}")
+    
+    # Most expensive queries
+    print("\n" + "-"*60)
+    print("TOP 5 MOST EXPENSIVE QUERIES")
+    print("-"*60)
+    
+    df['total_cost'] = df['cost'].apply(lambda x: x['total_usd'])
+    top_expensive = df.nlargest(5, 'total_cost')
+    
+    for _, row in top_expensive.iterrows():
+        print(f"\n{row['query'][:60]}...")
+        print(f"  Cost: ${row['total_cost']:.6f}")
+        print(f"  Tokens: {row['tokens']['total']}")
 
 
 if __name__ == "__main__":
@@ -301,10 +347,6 @@ if __name__ == "__main__":
     parser.add_argument("query", 
                        nargs='?',
                        help="Question to ask (or omit for interactive mode)")
-    parser.add_argument("--strategy", 
-                       choices=["basic", "rerank", "hybrid"],
-                       default="rerank",
-                       help="Retrieval strategy")
     parser.add_argument("--collection", 
                        default="papers",
                        help="ChromaDB collection name")
@@ -315,19 +357,17 @@ if __name__ == "__main__":
     parser.add_argument("--interactive",
                        action="store_true",
                        help="Start interactive mode")
+    parser.add_argument("--analyze",
+                       action="store_true",
+                       help="Analyze benchmark logs")
     
     args = parser.parse_args()
     
-    if args.interactive or not args.query:
-        # Interactive mode
-        interactive_mode(collection_name=args.collection,
-                        retrieval_strategy=args.strategy)
+    if args.analyze:
+        analyze_benchmarks()
+    elif args.interactive or not args.query:
+        interactive_mode(collection_name=args.collection)
     else:
-        # Single query mode
-        answer = answer_question(args.query,
-                                collection_name=args.collection,
-                                retrieval_strategy=args.strategy,
-                                top_k=args.top_k)
-        
-        if answer:
-            print(f"\n📝 Answer:\n{answer}")
+        answer_question(args.query,
+                       collection_name=args.collection,
+                       top_k=args.top_k)
